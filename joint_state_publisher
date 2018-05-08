@@ -1,0 +1,679 @@
+#!/usr/bin/env python
+
+import pyaudio 
+import rospy
+import time
+import random
+import struct
+from scipy import signal
+import wx
+import wx.lib.newevent
+import xml.dom.minidom
+import numpy as np
+from sensor_msgs.msg import JointState
+from math import pi
+from threading import Thread
+
+RANGE = 10000
+dilsdancing8 = [[0.0, 0.0, 0.0],[1.0, 0.0, 0.0],[2.0, 0.0, 0.0],[3.0, 0.0, 0.0],[4.0, 0.0, 0.0],[5.0, 0.0, 0.0],[6.0, -0.715,-0.715 ],[7.0, -0.45,0.62 ],[8.0 ,-0.095 ,-0.225],[9.0 ,0.11 ,-1.82],[10.0, 0.48,0.48 ],[11.0 ,0.0 ,0.0],[12.0, 0.695,0.695 ],[13.0, -0.23,0.21 ],[14.0, 0.095,0.425 ],[15.0,0.0,0.0],[16.0, 0.0, 0.0]]
+
+start_time = time.time()
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 2
+RATE = 44100
+CHUNK = 1024
+RECORD_SECONDS = 0.025
+WAVE_OUTPUT_FILENAME = "file.wav"
+fouriers_per_second = 24  # Frames per second
+fourier_spread = 1.0 / fouriers_per_second
+fourier_width = fourier_spread
+
+######AUDIO CODE #############################
+
+##define new_stream Pyaudio instance, for opeing the audio streame 
+def new_stream():
+	stream = audio.open(format=FORMAT,
+		channels=CHANNELS - 1,
+		rate=RATE,
+		input=True,
+		frames_per_buffer=CHUNK)
+	return  stream
+
+
+def getFFT(data,rate):
+    """Given some data and rate, returns FFTfreq and FFT (half)."""
+    data=data*np.hamming(len(data))
+    fft=np.fft.fftshift(data)
+    fft=np.abs(fft)
+    #fft=10*np.log10(fft)
+    freq=np.fft.fftfreq(len(fft),1.0/rate)
+
+    return freq[:int(len(freq)/2)],fft[:int(len(fft)/2)]
+
+
+
+
+
+
+
+
+def getBandWidth():
+    return (2.0 / RATE) * (RATE / 2.0)
+
+
+
+def freqToIndex(f):
+# If f (frequency is lower than the bandwidth of spectrum[0]
+    if f < getBandWidth() / 2: 
+        return 0 
+    if f > (RATE / 2) - (getBandWidth() / 2): 
+        return (RATE - 1)
+    fraction = float(f) / float(RATE)
+    index = round(RECORD_SECONDS * RATE * fraction)
+    return index
+
+
+
+fft_averages = []
+
+
+def average_fft_bands(fft_array):
+    num_bands = 20  # The number of frequency bands (12 = 1 octave)
+    del fft_averages[:]
+	
+    for band in range(0, num_bands):
+        avg = 0.0
+
+        if band == 0:
+            lowFreq = int(0)
+        else:
+            lowFreq = int(int(RATE / 2) / float(2 ** (num_bands - band)))
+            hiFreq = int((RATE / 2) / float(2 ** ((num_bands - 1) - band)))
+            lowBound = int(freqToIndex(lowFreq))
+            hiBound = int(freqToIndex(hiFreq))
+            if(hiBound >= 1023):
+                hiBound = 1022
+            for j in range(lowBound, hiBound):
+                avg += fft_array[j]
+            avg /= (hiBound - lowBound + 1)
+            fft_averages.append(avg)
+
+
+
+#100
+fourier_width_index = fourier_width * float(44100)
+
+audio = pyaudio.PyAudio()
+
+# start Recording
+
+
+
+
+######AUDIO CLOSE ######################
+
+
+
+
+
+
+def get_param(name, value=None):
+    private = "~%s" % name
+    if rospy.has_param(private):
+        return rospy.get_param(private)
+    elif rospy.has_param(name):
+        return rospy.get_param(name)
+    else:
+        return value
+
+class JointStatePublisher():
+    def __init__(self):
+        description = get_param('robot_description')
+        robot = xml.dom.minidom.parseString(description).getElementsByTagName('robot')[0]
+        self.free_joints = {}
+        self.joint_list = [] # for maintaining the original order of the joints
+        self.dependent_joints = get_param("dependent_joints", {})
+        use_mimic = get_param('use_mimic_tags', True)
+        use_small = get_param('use_smallest_joint_limits', True)
+
+        self.zeros = get_param("zeros")
+
+        pub_def_positions = get_param("publish_default_positions", True)
+        pub_def_vels = get_param("publish_default_velocities", False)
+        pub_def_efforts = get_param("publish_default_efforts", False)
+
+        # Find all non-fixed joints
+        for child in robot.childNodes:
+            if child.nodeType is child.TEXT_NODE:
+                continue
+            if child.localName == 'joint':
+                jtype = child.getAttribute('type')
+                if jtype == 'fixed' or jtype == 'floating':
+                    continue
+                name = child.getAttribute('name')
+                self.joint_list.append(name)
+                if jtype == 'continuous':
+                    minval = -pi
+                    maxval = pi
+                else:
+                    try:
+                        limit = child.getElementsByTagName('limit')[0]
+                        minval = float(limit.getAttribute('lower'))
+                        maxval = float(limit.getAttribute('upper'))
+                    except:
+                        rospy.logwarn("%s is not fixed, nor continuous, but limits are not specified!" % name)
+                        continue
+
+                safety_tags = child.getElementsByTagName('safety_controller')
+                if use_small and len(safety_tags)==1:
+                    tag = safety_tags[0]
+                    if tag.hasAttribute('soft_lower_limit'):
+                        minval = max(minval, float(tag.getAttribute('soft_lower_limit')))
+                    if tag.hasAttribute('soft_upper_limit'):
+                        maxval = min(maxval, float(tag.getAttribute('soft_upper_limit')))
+
+                mimic_tags = child.getElementsByTagName('mimic')
+                if use_mimic and len(mimic_tags)==1:
+                    tag = mimic_tags[0]
+                    entry = {'parent': tag.getAttribute('joint')}
+                    if tag.hasAttribute('multiplier'):
+                        entry['factor'] = float(tag.getAttribute('multiplier'))
+                    if tag.hasAttribute('offset'):
+                        entry['offset'] = float(tag.getAttribute('offset'))
+
+                    self.dependent_joints[name] = entry
+                    continue
+
+                if name in self.dependent_joints:
+                    continue
+
+                if self.zeros and name in self.zeros:
+                    zeroval = self.zeros[name]
+                elif minval > 0 or maxval < 0:
+                    zeroval = (maxval + minval)/2
+                else:
+                    zeroval = 0
+
+                joint = {'min':minval, 'max':maxval, 'zero':zeroval}
+                if pub_def_positions:
+                    joint['position'] = zeroval
+                if pub_def_vels:
+                    joint['velocity'] = 0.0
+                if pub_def_efforts:
+                    joint['effort'] = 0.0
+
+                if jtype == 'continuous':
+                    joint['continuous'] = True
+                self.free_joints[name] = joint
+
+
+        use_gui = get_param("use_gui", False)
+
+        if use_gui:
+            self.app = wx.App()
+            self.gui = JointStatePublisherGui("Joint State Publisher", self)
+            self.gui.Show()
+    #dildil    else:
+        else:
+            self.gui = None       
+
+    
+        self.gui = None
+
+        source_list = get_param("source_list", [])
+        self.sources = []
+        for source in source_list:
+            self.sources.append(rospy.Subscriber(source, JointState, self.source_cb))
+
+        self.pub = rospy.Publisher('joint_states', JointState, queue_size=5)
+
+    def source_cb(self, msg):
+        for i in range(len(msg.name)):
+            name = msg.name[i]
+            if name not in self.free_joints:
+                continue
+
+            if msg.position:
+                position = msg.position[i]
+            else:
+                position = None
+            if msg.velocity:
+                velocity = msg.velocity[i]
+            else:
+                velocity = None
+            if msg.effort:
+                effort = msg.effort[i]
+            else:
+                effort = None
+
+            joint = self.free_joints[name]
+            if position is not None:
+                joint['position'] = position
+            if velocity is not None:
+                joint['velocity'] = velocity
+            if effort is not None:
+                joint['effort'] = effort
+
+        if self.gui is not None:
+            # post an event here instead of directly calling the update_sliders method, to switch to the wx thread
+            wx.PostEvent(self.gui.GetEventHandler(), self.gui.UpdateSlidersEvent())
+    
+         
+    def loop(self):
+        hz = get_param("rate", 10) # 10hz
+        r = rospy.Rate(hz)
+        dils_dancing_array = [0,1,2,3,4,5,6,7,8,7,6,5,4,3,2,1]
+	#dilsdancing8 = [[6.0,-0.535, -0.615],[7.0,0.0,-0.36],[8.0,0.175,0.715],[9.0,0.0,0.26],[11.0,0.15],[13.0, 0.005],[14.0,0.0425],[15.0,1.3]]  
+        delta = get_param("delta", 0.0)
+        dil = 0
+        dil2 = 0 
+        av_freak_holder = [0,0,0,0] 
+      ##dil
+        p = -1.2
+        t = 0.05
+	dilsdancing = 8
+        # Publish Joint States
+        while not rospy.is_shutdown():
+            av_freak_holder = [0,0,0,0]
+            n_s = new_stream()
+            
+            time_now = (time.time() -start_time)
+ 		
+            if (True):
+                data = 0
+                for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
+                    data = n_s.read(CHUNK) 
+                    data_int = struct.unpack(str(2 * CHUNK) + 'B', data)
+                    data_int = np.array(struct.unpack(str(2* CHUNK) + 'B', data), dtype='b')[::2] +127
+
+                data_int = signal.detrend(data_int)	
+                print(len(data_int))
+
+                freakyboy , figetdude = getFFT(data_int, 32768)
+
+                fidgetbroskendomanthefith = figetdude/1000
+
+            
+                
+                perrie = len(fidgetbroskendomanthefith)
+
+                av1 = 0
+                for i in range(0,(perrie/4)-1):
+                    av1 += fidgetbroskendomanthefith[i]
+                av2 = 0
+                for i in range(perrie/4,(perrie/2)-1):
+                    av2 += fidgetbroskendomanthefith[i]
+                av3 = 0 
+                for i in range(perrie/2,((3*perrie)/4)-1):
+                    av3 += fidgetbroskendomanthefith[i]
+                av4 = 0
+                for i in range((3*perrie/4), perrie-1):
+                    av4 += fidgetbroskendomanthefith[i]
+
+	 
+                av_freak_holder[0] = av1/(perrie/5)
+                av_freak_holder[1] = av2/(perrie/4)
+                av_freak_holder[2] = av3/(perrie/4)
+                av_freak_holder[3] = av4/(perrie/4)
+                new_move = True
+                total_amplitude = (av_freak_holder[0]+av_freak_holder[1]+av_freak_holder[2]+av_freak_holder[3])
+
+            else:
+                n_s.stop_stream()                
+                new_move = False
+
+            
+            msg = JointState()
+            msg.header.stamp = rospy.Time.now()
+            if dil > 15:
+                dil = 0
+            if dil2 > 7:
+                dil2 = 0
+            if delta > 0:
+                self.update(delta)
+
+            # Initialize msg.position, msg.velocity, and msg.effort.
+            has_position = len(self.dependent_joints.items()) > 0
+            has_velocity = False
+            has_effort = False
+            for (name,joint) in self.free_joints.items():
+                if not has_position and 'position' in joint:
+                    has_position = True
+                if not has_velocity and 'velocity' in joint:
+                    has_velocity = True
+                if not has_effort and 'effort' in joint:
+                    has_effort = True
+            num_joints = (len(self.free_joints.items()) +
+                          len(self.dependent_joints.items()))
+            if has_position:
+                msg.position = num_joints * [0.0]
+            if has_velocity:
+                msg.velocity = num_joints * [0.0]
+            if has_effort:
+                msg.effort = num_joints * [0.0]
+            
+            
+            for i, name in enumerate(self.joint_list):
+                msg.name.append(str(name))
+                joint = None
+
+                # Add Free Joint
+                if name in self.free_joints:
+                    joint = self.free_joints[name]
+                    factor = 1
+                    offset = 0
+                # Add Dependent Joint
+                elif name in self.dependent_joints:
+                    param = self.dependent_joints[name]
+                    parent = param['parent']
+                    joint = self.free_joints[parent]
+                    factor = param.get('factor', 1)
+                    offset = param.get('offset', 0)
+ 
+    
+                if has_position and 'position' in joint: 
+                    if(total_amplitude > 0.19 and (av_freak_holder[0])):
+                                             
+               		all_freak = 0.0
+			for n in range (0,3):
+                            all_freak += av_freak_holder[n]
+
+
+                        if( all_freak > 0.2) :
+                            all_freak = all_freak/3
+                        else:
+                            all_freak = -2 * all_freak
+
+
+			##define movements for peppers arms
+
+                        LSR = dilsdancing8[6][1]
+                        lsr_adder = (LSR - dilsdancing8[6][2])/dilsdancing
+                        if(dilsdancing8[6][1] > dilsdancing8[6][2]):
+                            lsr_adder = - lsr_adder
+                       
+
+                        LEY = dilsdancing8[7][1]
+                        ley_adder = (LEY - dilsdancing8[7][2])/dilsdancing
+                        if(dilsdancing8[7][1] < dilsdancing8[7][2]):
+                            ley_adder = - ley_adder
+
+                        LER = dilsdancing8[8][1]
+                        ler_adder = (LER - dilsdancing8[8][2])/dilsdancing
+                        if(dilsdancing8[8][1] < dilsdancing8[8][2]):
+                            ler_adder = - ler_adder
+ 
+                        LWY = dilsdancing8[9][1]
+                        lwy_adder = (LWY - dilsdancing8[9][2])/dilsdancing
+                        if(dilsdancing8[9][1] > dilsdancing8[9][2]):
+                           lwy_adder = - lwy_adder
+                                                
+
+                        RSR = dilsdancing8[12][1]
+                        rsr_adder = (RSR - dilsdancing8[12][2])/dilsdancing
+                        if(dilsdancing8[12][1] > dilsdancing8[12][2]):
+                            rsr_adder = - rsr_adder
+
+
+                        REY = dilsdancing8[13][1]
+                        rey_adder = (REY - dilsdancing8[13][2])/dilsdancing
+                        if(dilsdancing8[13][1] > dilsdancing8[13][2]):
+                            rey_adder = - rey_adder
+
+                        RER = dilsdancing8[14][1]
+                        rer_adder = (RER - dilsdancing8[14][2])/dilsdancing
+                        if(dilsdancing8[14][1] > dilsdancing8[14][2]):
+                            rer_adder = - rer_adder
+
+			#i reprents the differing joint values
+ 			# run if statement on combinations of the frequency ranges to move pepper to the music
+                        elif(i == 6):
+                            if(av_freak_holder[0]< 0.01):
+                                msg.position[6] = joint['position'] * factor + offset  + (dils_dancing_array[dil] * av_freak_holder[0])
+                            elif(av_freak_holder[1] > av_freak_holder[0]):
+                                msg.position[6] = joint['position'] * factor + offset  + (dils_dancing_array[dil] * av_freak_holder[1])             
+                            elif(av_freak_holder[2] < av_freak_holder[1]/2):
+                                msg.position[6] = joint['position'] * factor + offset - (dils_dancing_array[dil] * 3 * av_freak_holder[2])
+                            elif(av_freak_holder[3] < 0.01):
+                                msg.position[6] = joint['position'] * factor + offset  - (dils_dancing_array[dil] ** av_freak_holder[3] )
+                            else:
+                                msg.position[6] = joint['position'] * factor + offset                                                 
+                           
+                        elif(i == 7):
+                            if(av_freak_holder[0] < 0.01):
+                                msg.position[7] = joint['position'] * factor + offset  - (dils_dancing_array[dil] * av_freak_holder[0])
+                            elif(av_freak_holder[1] > av_freak_holder[0]):
+                                msg.position[7] = joint['position'] * factor + offset  - (dils_dancing_array[dil] * av_freak_holder[1])
+                            elif(av_freak_holder[2] < av_freak_holder[1]/2):
+                                msg.position[7] = joint['position'] * factor + offset + (dils_dancing_array[dil] * 3 * av_freak_holder[2])
+                            elif(av_freak_holder[3] < 0.01):
+                                msg.position[7] = joint['position'] * factor + offset  + (dils_dancing_array[dil] ** av_freak_holder[3])
+                            else:
+                                msg.position[7] = joint['position'] * factor + offset
+      
+                        elif(i == 8):
+                            if(av_freak_holder[0] < 0.01):
+                                msg.position[8] = joint['position'] * factor + offset  + (dils_dancing_array[dil] * av_freak_holder[0])
+                            elif(av_freak_holder[1] > av_freak_holder[0]):
+                                msg.position[8] = joint['position'] * factor + offset  - (dils_dancing_array[dil] * av_freak_holder[1])
+                            elif(av_freak_holder[2] < av_freak_holder[1]/2):
+                                msg.position[8] = joint['position'] * factor + offset + (dils_dancing_array[dil] * 3 * av_freak_holder[2])
+                            elif(av_freak_holder[3] < 0.01):
+                                msg.position[8] = joint['position'] * factor + offset  - (dils_dancing_array[dil] ** av_freak_holder[3])
+                            else:
+                                msg.position[8] = joint['position'] * factor + offset  
+      
+                        elif(i == 9):
+                            if(av_freak_holder[0]< 0.01):
+                                msg.position[9] = joint['position'] * factor + offset  - (dils_dancing_array[dil] * av_freak_holder[0])
+                            elif(av_freak_holder[1] > av_freak_holder[0]):
+                                msg.position[9] = joint['position'] * factor + offset  + (dils_dancing_array[dil] * av_freak_holder[1])
+                            elif(av_freak_holder[2] < av_freak_holder[1]/2):
+                                msg.position[9] = joint['position'] * factor + offset - (dils_dancing_array[dil] * 3 * av_freak_holder[2])
+                            elif(av_freak_holder[3] < 0.01):
+                                msg.position[9] = joint['position'] * factor + offset  + (dils_dancing_array[dil] ** av_freak_holder[3])
+                            else:
+                                msg.position[9] = joint['position'] * factor + offset
+  	        
+                        elif(i == 10):
+                       	    if(av_freak_holder[3] < av_freak_holder[2]):
+                                msg.position[10] = joint['position'] * factor + offset  + LER - (dils_dancing_array[dil] * all_freak)
+                            elif(av_freak_holder[3] > 0.01):
+                                msg.position[10] = joint['position'] * factor + offset  + LWY + (dils_dancing_array[dil] * all_freak)       
+                            elif(av_freak_holder[2] < 0.05):
+                                msg.position[10] = joint['position'] * factor + offset  + 0.48
+                            elif(av_freak_holder[0] > 0.15):
+                                msg.position[10] = joint['position'] * factor + offset + 0.695 + RSR  + (dils_dancing_array[dil] * all_freak)
+                       	    else:
+                                msg.position[10] = joint['position'] * factor + offset
+   
+                        elif(i == 13):
+                            if(av_freak_holder[3] < av_freak_holder[2]):
+                                msg.position[13] = joint['position'] * factor + offset  + REY - (dils_dancing_array[dil] * all_freak)
+                            elif(av_freak_holder[3] > 0.01):
+                                msg.position[13] = joint['position'] * factor + offset  - REY + (dils_dancing_array[dil] * all_freak)
+                            elif(av_freak_holder[2] < 0.05):
+                                msg.position[13] = joint['position'] * factor + offset  + 0.48
+                            elif(av_freak_holder[0] > 0.15):
+                                msg.position[13] = joint['position'] * factor + offset  - REY  + (dils_dancing_array[dil] * all_freak)
+                       	    else:
+                                msg.position[13] = joint['position'] * factor + offset
+			
+                        elif(i == 14):
+		            if(av_freak_holder[3] < av_freak_holder[2]):
+                                msg.position[14] = joint['position'] * factor + offset  - RER - (dils_dancing_array[dil] * all_freak)
+                            elif(av_freak_holder[3] > 0.01):
+                                msg.position[14] = joint['position'] * factor + offset  + RER + (dils_dancing_array[dil] * all_freak)
+                            elif(av_freak_holder[2] < 0.05):
+                                msg.position[14] = joint['position'] * factor + offset  - (RER * all_freak)
+                            elif(av_freak_holder[0] > 0.15):
+                                msg.position[14] = joint['position'] * factor + offset  + RER  + (dils_dancing_array[dil] * all_freak)
+                            else:
+                                msg.position[14] = joint['position'] * factor + offset
+
+
+                        else:     
+                            msg.position[i] = joint['position'] * factor + offset
+#                    elif(new_move == False):
+ #                       msg.position[i] = joint['position'] * factor + offset
+                    
+
+               
+                if has_velocity and 'velocity' in joint:
+                    msg.velocity[i] = joint['velocity'] * factor
+                if has_effort and 'effort' in joint:
+                    msg.effort[i] = joint['effort']
+
+	    #increment a variables
+            dil += 1
+            dil2 += 1
+
+	    #stop and close stream to avoid over filling              
+            n_s.stop_stream()
+            n_s.close()
+         
+	    self.pub.publish(msg)
+            
+            try:
+                r.sleep()
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                pass
+
+    def update(self, delta):
+        for name, joint in self.free_joints.iteritems():
+            forward = joint.get('forward', True)
+            if forward:
+                joint['position'] += delta
+                if joint['position'] > joint['max']:
+                    if joint.get('continuous', False):
+                        joint['position'] = joint['min']
+                    else:
+                        joint['position'] = joint['max']
+                        joint['forward'] = not forward
+            else:
+                joint['position'] -= delta
+                if joint['position'] < joint['min']:
+                    joint['position'] = joint['min']
+                    joint['forward'] = not forward
+
+class JointStatePublisherGui(wx.Frame):
+    def __init__(self, title, jsp):
+        wx.Frame.__init__(self, None, -1, title, (-1, -1));
+        self.jsp = jsp
+        self.joint_map = {}
+        panel = wx.ScrolledWindow(self, wx.ID_ANY, style= wx.VSCROLL);
+        box = wx.BoxSizer(wx.VERTICAL)
+        font = wx.Font(9, wx.SWISS, wx.NORMAL, wx.BOLD)
+
+        ### Sliders ###
+        for name in self.jsp.joint_list:
+            if name not in self.jsp.free_joints:
+                continue
+            joint = self.jsp.free_joints[name]
+
+            if joint['min'] == joint['max']:
+                continue
+
+            row = wx.GridSizer(1,2)
+            label = wx.StaticText(panel, -1, name)
+            label.SetFont(font)
+            row.Add(label, 1, wx.ALIGN_CENTER_VERTICAL)
+
+            display = wx.TextCtrl (panel, value=str(0),
+                        style=wx.TE_READONLY | wx.ALIGN_RIGHT)
+
+            row.Add(display, flag= wx.ALIGN_RIGHT| wx.ALIGN_CENTER_VERTICAL)
+            box.Add(row, 1, wx.EXPAND)
+            slider = wx.Slider(panel, -1, RANGE/2, 0, RANGE,
+                        style= wx.SL_AUTOTICKS | wx.SL_HORIZONTAL)
+            slider.SetFont(font)
+            box.Add(slider, 1, wx.EXPAND)
+
+            self.joint_map[name] = {'slidervalue':0, 'display':display,
+                                    'slider':slider, 'joint':joint}
+
+        self.UpdateSlidersEvent, self.EVT_UPDATESLIDERS = wx.lib.newevent.NewEvent()
+        self.Bind(self.EVT_UPDATESLIDERS, self.updateSliders)
+
+        ### Buttons ###
+        self.randbutton = wx.Button(panel, 1, 'Randomize')
+        self.ctrbutton = wx.Button(panel, 2, 'Center')
+        self.Bind(wx.EVT_SLIDER, self.sliderUpdate)
+
+        wx.EVT_BUTTON(self, 1, self.randomize_event)
+        wx.EVT_BUTTON(self, 2, self.center_event)
+
+        box.Add(self.randbutton, 0, wx.EXPAND)
+        box.Add(self.ctrbutton, 1, wx.EXPAND)
+
+        panel.SetSizer(box)
+        self.center()
+        box.Fit(self)
+        panel.SetScrollRate(0,slider.GetSize().GetHeight()+row.GetSize().GetHeight())
+        self.update_values()
+
+
+    def update_values(self):          
+        for (name,joint_info) in self.joint_map.items():
+            purevalue = joint_info['slidervalue']
+            joint = joint_info['joint']
+            value = self.sliderToValue(purevalue, joint)
+            joint['position'] = value
+        self.update_sliders()
+
+    def updateSliders(self, event):
+        self.update_sliders()
+
+    def update_sliders(self):
+        for (name,joint_info) in self.joint_map.items():
+            joint = joint_info['joint']
+            joint_info['slidervalue'] = self.valueToSlider(joint['position'],
+                                                           joint)
+            joint_info['slider'].SetValue(joint_info['slidervalue'])
+            joint_info['display'].SetValue("%.2f"%joint['position'])
+
+    def center_event(self, event):
+        self.center()
+
+    def center(self):
+        rospy.loginfo("Centering")
+        for (name,joint_info) in self.joint_map.items():
+            joint = joint_info['joint']
+            joint_info['slidervalue'] = self.valueToSlider(joint['zero'], joint)
+        self.update_values()
+
+    def randomize_event(self, event):
+        self.randomize()
+
+    def randomize(self):
+        rospy.loginfo("Randomizing")
+        for (name,joint_info) in self.joint_map.items():
+            joint = joint_info['joint']
+            joint_info['slidervalue'] = self.valueToSlider(random.uniform(joint['min'], joint['max']), joint)
+        self.update_values()
+
+
+    def sliderUpdate(self, event):
+        for (name,joint_info) in self.joint_map.items():
+            joint_info['slidervalue'] = joint_info['slider'].GetValue()
+        self.update_values()
+
+    def valueToSlider(self, value, joint):
+        return (value - joint['min']) * float(RANGE) / (joint['max'] - joint['min'])
+
+    def sliderToValue(self, slider, joint):
+        pctvalue = slider / float(RANGE)
+        return joint['min'] + (joint['max']-joint['min']) * pctvalue
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('joint_state_publisher')
+        jsp = JointStatePublisher()
+        if jsp.gui is None:
+            jsp.loop()
+        else:
+            Thread(target=jsp.loop).start()
+            jsp.app.MainLoop()
+    except rospy.ROSInterruptException: pass
